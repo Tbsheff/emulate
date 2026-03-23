@@ -3,6 +3,7 @@ import type { ServicePlugin, Store, WebhookDispatcher, TokenMap, AppEnv, RouteCo
 import { getIdpStore } from "./store.js";
 import { generateUid } from "./helpers.js";
 import { generateSigningKeySync, importSigningKey } from "./crypto.js";
+import { oidcRoutes } from "./routes/oidc.js";
 
 export { getIdpStore, type IdpStore } from "./store.js";
 export * from "./entities.js";
@@ -169,8 +170,7 @@ export const idpPlugin: ServicePlugin = {
   name: "idp",
   register(app: Hono<AppEnv>, store: Store, webhooks: WebhookDispatcher, baseUrl: string, tokenMap?: TokenMap): void {
     const ctx: RouteContext = { app, store, webhooks, baseUrl, tokenMap };
-    // OIDC routes will be added in Sprint 4
-    // oidcRoutes(ctx);
+    oidcRoutes(ctx);
   },
   seed(store: Store, baseUrl: string): void {
     seedDefaults(store, baseUrl);
