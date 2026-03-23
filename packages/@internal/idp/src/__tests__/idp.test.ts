@@ -1,5 +1,8 @@
 import { describe, it, expect } from "vitest";
-import { Store, WebhookDispatcher } from "@internal/core";
+import { createHash } from "crypto";
+import { Hono } from "hono";
+import type { AppEnv, TokenMap } from "@internal/core";
+import { Store, WebhookDispatcher, authMiddleware } from "@internal/core";
 import { idpPlugin, seedFromConfig, type IdpSeedConfig } from "../index.js";
 import { getIdpStore } from "../store.js";
 import { generateSigningKeySync } from "../crypto.js";
@@ -146,5 +149,463 @@ describe("seedFromConfig", () => {
     expect(groups.length).toBe(1);
     expect(groups[0].name).toBe("engineering");
     expect(groups[0].display_name).toBe("Engineering Team");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// OIDC Integration Tests
+// ---------------------------------------------------------------------------
+
+function createTestApp(config?: IdpSeedConfig) {
+  const store = new Store();
+  const webhooks = new WebhookDispatcher();
+  const tokenMap: TokenMap = new Map();
+
+  // Pre-seeded token for userinfo tests
+  tokenMap.set("test-bearer-token", { login: "alice@example.com", id: 1, scopes: ["openid", "email", "profile", "groups", "roles"] });
+
+  const app = new Hono<AppEnv>();
+
+  // Add auth middleware
+  app.use("*", authMiddleware(tokenMap));
+
+  // Register plugin
+  idpPlugin.register(app as any, store, webhooks, "http://localhost:4003", tokenMap);
+
+  // Seed defaults
+  idpPlugin.seed!(store, "http://localhost:4003");
+  if (config) {
+    seedFromConfig(store, "http://localhost:4003", config);
+  }
+
+  return { app, store, tokenMap };
+}
+
+describe("OIDC Discovery", () => {
+  it("returns valid openid-configuration", async () => {
+    const { app } = createTestApp();
+    const res = await app.request("/.well-known/openid-configuration");
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.issuer).toBe("http://localhost:4003");
+    expect(body.authorization_endpoint).toBe("http://localhost:4003/authorize");
+    expect(body.token_endpoint).toBe("http://localhost:4003/token");
+    expect(body.userinfo_endpoint).toBe("http://localhost:4003/userinfo");
+    expect(body.jwks_uri).toBe("http://localhost:4003/jwks.json");
+    expect(body.id_token_signing_alg_values_supported).toContain("RS256");
+    expect(body.grant_types_supported).toContain("authorization_code");
+    expect(body.grant_types_supported).toContain("refresh_token");
+    expect(body.code_challenge_methods_supported).toContain("S256");
+  });
+
+  it("uses custom issuer when configured", async () => {
+    const { app } = createTestApp({ oidc: { issuer: "https://custom.example.com" } });
+    const res = await app.request("/.well-known/openid-configuration");
+    const body = await res.json();
+    expect(body.issuer).toBe("https://custom.example.com");
+  });
+});
+
+describe("JWKS", () => {
+  it("returns RSA public keys", async () => {
+    const { app } = createTestApp();
+    const res = await app.request("/jwks.json");
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.keys.length).toBeGreaterThan(0);
+    expect(body.keys[0].kty).toBe("RSA");
+    expect(body.keys[0].alg).toBe("RS256");
+    expect(body.keys[0].use).toBe("sig");
+    expect(body.keys[0].kid).toBeDefined();
+    expect(body.keys[0].n).toBeDefined();
+    expect(body.keys[0].e).toBeDefined();
+  });
+});
+
+describe("Authorize", () => {
+  it("renders sign-in page with seeded users", async () => {
+    const { app } = createTestApp({
+      users: [
+        { email: "alice@example.com", name: "Alice" },
+        { email: "bob@example.com", name: "Bob" },
+      ],
+    });
+    const res = await app.request("/authorize?response_type=code&client_id=test&redirect_uri=http://localhost:3000/cb&scope=openid&state=xyz");
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html).toContain("alice@example.com");
+    expect(html).toContain("bob@example.com");
+  });
+
+  it("rejects unknown client_id in strict mode", async () => {
+    const { app } = createTestApp({
+      strict: true,
+      oidc: { clients: [{ client_id: "known", client_secret: "s", redirect_uris: ["http://localhost/cb"] }] },
+    });
+    const res = await app.request("/authorize?response_type=code&client_id=unknown&redirect_uri=http://localhost/cb");
+    expect(res.status).toBe(400);
+  });
+
+  it("rejects unregistered redirect_uri in strict mode", async () => {
+    const { app } = createTestApp({
+      strict: true,
+      oidc: { clients: [{ client_id: "known", client_secret: "s", redirect_uris: ["http://localhost/cb"] }] },
+    });
+    const res = await app.request("/authorize?response_type=code&client_id=known&redirect_uri=http://evil.com/cb");
+    expect(res.status).toBe(400);
+  });
+});
+
+describe("Authorization Code Flow", () => {
+  it("completes full auth code exchange", async () => {
+    const { app } = createTestApp({
+      users: [{ email: "alice@example.com", name: "Alice" }],
+      oidc: { clients: [{ client_id: "app", client_secret: "secret", redirect_uris: ["http://localhost:3000/cb"] }] },
+    });
+
+    // Step 1: POST callback to get auth code
+    const callbackRes = await app.request("/authorize/callback", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        uid: "will-be-looked-up",
+        redirect_uri: "http://localhost:3000/cb",
+        scope: "openid email profile offline_access",
+        state: "test-state",
+        client_id: "app",
+      }).toString(),
+    });
+    expect(callbackRes.status).toBe(302);
+    const location = callbackRes.headers.get("Location")!;
+    expect(location).toContain("code=");
+    expect(location).toContain("state=test-state");
+
+    const url = new URL(location);
+    const code = url.searchParams.get("code")!;
+
+    // Step 2: Exchange code for tokens
+    const tokenRes = await app.request("/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: "http://localhost:3000/cb",
+        client_id: "app",
+        client_secret: "secret",
+      }).toString(),
+    });
+    expect(tokenRes.status).toBe(200);
+    const tokens = await tokenRes.json();
+    expect(tokens.access_token).toBeDefined();
+    expect(tokens.access_token).toMatch(/^idp_/);
+    expect(tokens.id_token).toBeDefined();
+    expect(tokens.token_type).toBe("Bearer");
+    expect(tokens.expires_in).toBeDefined();
+    expect(tokens.refresh_token).toBeDefined();
+    expect(tokens.refresh_token).toMatch(/^idprt_/);
+  });
+
+  it("rejects invalid code", async () => {
+    const { app } = createTestApp();
+    const res = await app.request("/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code: "invalid-code",
+        redirect_uri: "http://localhost:3000/cb",
+      }).toString(),
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toBe("invalid_grant");
+  });
+
+  it("rejects code reuse", async () => {
+    const { app } = createTestApp({
+      users: [{ email: "test@test.com" }],
+    });
+
+    const cbRes = await app.request("/authorize/callback", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        uid: "any",
+        redirect_uri: "http://localhost:3000/cb",
+        scope: "openid",
+        client_id: "test",
+      }).toString(),
+    });
+    const loc = cbRes.headers.get("Location")!;
+    const code = new URL(loc).searchParams.get("code")!;
+
+    // First use succeeds
+    const firstRes = await app.request("/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ grant_type: "authorization_code", code, redirect_uri: "http://localhost:3000/cb" }).toString(),
+    });
+    expect(firstRes.status).toBe(200);
+
+    // Second use fails
+    const secondRes = await app.request("/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ grant_type: "authorization_code", code, redirect_uri: "http://localhost:3000/cb" }).toString(),
+    });
+    expect(secondRes.status).toBe(400);
+  });
+
+  it("supports client_secret_basic auth", async () => {
+    const { app } = createTestApp({
+      users: [{ email: "alice@example.com" }],
+      oidc: { clients: [{ client_id: "app", client_secret: "secret", redirect_uris: ["http://localhost:3000/cb"] }] },
+    });
+
+    const cbRes = await app.request("/authorize/callback", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        uid: "any", redirect_uri: "http://localhost:3000/cb", scope: "openid", client_id: "app",
+      }).toString(),
+    });
+    const code = new URL(cbRes.headers.get("Location")!).searchParams.get("code")!;
+
+    const basicAuth = Buffer.from("app:secret").toString("base64");
+    const tokenRes = await app.request("/token", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Authorization": `Basic ${basicAuth}`,
+      },
+      body: new URLSearchParams({ grant_type: "authorization_code", code, redirect_uri: "http://localhost:3000/cb" }).toString(),
+    });
+    expect(tokenRes.status).toBe(200);
+  });
+});
+
+describe("PKCE", () => {
+  it("validates S256 with correct verifier", async () => {
+    const { app } = createTestApp({ users: [{ email: "test@test.com" }] });
+    const verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+    const challenge = createHash("sha256").update(verifier).digest("base64url");
+
+    const cbRes = await app.request("/authorize/callback", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        uid: "any", redirect_uri: "http://localhost:3000/cb", scope: "openid",
+        client_id: "test", code_challenge: challenge, code_challenge_method: "S256",
+      }).toString(),
+    });
+    const code = new URL(cbRes.headers.get("Location")!).searchParams.get("code")!;
+
+    const tokenRes = await app.request("/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code", code, redirect_uri: "http://localhost:3000/cb", code_verifier: verifier,
+      }).toString(),
+    });
+    expect(tokenRes.status).toBe(200);
+  });
+
+  it("rejects S256 with wrong verifier", async () => {
+    const { app } = createTestApp({ users: [{ email: "test@test.com" }] });
+    const challenge = createHash("sha256").update("correct").digest("base64url");
+
+    const cbRes = await app.request("/authorize/callback", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        uid: "any", redirect_uri: "http://localhost:3000/cb", scope: "openid",
+        client_id: "test", code_challenge: challenge, code_challenge_method: "S256",
+      }).toString(),
+    });
+    const code = new URL(cbRes.headers.get("Location")!).searchParams.get("code")!;
+
+    const tokenRes = await app.request("/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code", code, redirect_uri: "http://localhost:3000/cb", code_verifier: "wrong",
+      }).toString(),
+    });
+    expect(tokenRes.status).toBe(400);
+    const body = await tokenRes.json();
+    expect(body.error).toBe("invalid_grant");
+  });
+});
+
+describe("Refresh Token", () => {
+  async function getTokensWithRefresh(app: any) {
+    const cbRes = await app.request("/authorize/callback", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        uid: "any", redirect_uri: "http://localhost:3000/cb", scope: "openid offline_access", client_id: "app",
+      }).toString(),
+    });
+    const code = new URL(cbRes.headers.get("Location")!).searchParams.get("code")!;
+    const tokenRes = await app.request("/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code", code, redirect_uri: "http://localhost:3000/cb", client_id: "app", client_secret: "secret",
+      }).toString(),
+    });
+    return tokenRes.json();
+  }
+
+  it("issues refresh token with offline_access scope", async () => {
+    const { app } = createTestApp({
+      users: [{ email: "alice@example.com" }],
+      oidc: { clients: [{ client_id: "app", client_secret: "secret", redirect_uris: ["http://localhost:3000/cb"] }] },
+    });
+    const tokens = await getTokensWithRefresh(app);
+    expect(tokens.refresh_token).toBeDefined();
+    expect(tokens.refresh_token).toMatch(/^idprt_/);
+  });
+
+  it("exchanges refresh token for new tokens", async () => {
+    const { app } = createTestApp({
+      users: [{ email: "alice@example.com" }],
+      oidc: { clients: [{ client_id: "app", client_secret: "secret", redirect_uris: ["http://localhost:3000/cb"] }] },
+    });
+    const tokens = await getTokensWithRefresh(app);
+
+    const refreshRes = await app.request("/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "refresh_token", refresh_token: tokens.refresh_token, client_id: "app", client_secret: "secret",
+      }).toString(),
+    });
+    expect(refreshRes.status).toBe(200);
+    const newTokens = await refreshRes.json();
+    expect(newTokens.access_token).toBeDefined();
+    expect(newTokens.access_token).not.toBe(tokens.access_token);
+    expect(newTokens.refresh_token).toBeDefined();
+    expect(newTokens.refresh_token).not.toBe(tokens.refresh_token); // rotated
+  });
+
+  it("rejects invalid refresh token", async () => {
+    const { app } = createTestApp();
+    const res = await app.request("/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: "invalid" }).toString(),
+    });
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.error).toBe("invalid_grant");
+  });
+});
+
+describe("Userinfo", () => {
+  it("returns user claims with valid bearer token", async () => {
+    const { app, store, tokenMap } = createTestApp({
+      users: [{ email: "alice@example.com", name: "Alice Example", groups: ["admins"], roles: ["owner"] }],
+    });
+
+    // Register a token for the user
+    tokenMap.set("test-token", { login: "alice@example.com", id: 1, scopes: ["openid", "email", "profile", "groups", "roles"] });
+
+    const res = await app.request("/userinfo", {
+      headers: { "Authorization": "Bearer test-token" },
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.email).toBe("alice@example.com");
+    expect(body.name).toBe("Alice Example");
+    expect(body.groups).toEqual(["admins"]);
+    expect(body.roles).toEqual(["owner"]);
+  });
+
+  it("returns 401 without auth", async () => {
+    const { app } = createTestApp();
+    const res = await app.request("/userinfo");
+    expect(res.status).toBe(401);
+  });
+});
+
+describe("Revoke", () => {
+  it("revokes access token and returns 200", async () => {
+    const { app, tokenMap } = createTestApp();
+    tokenMap.set("idp_to_revoke", { login: "test@test.com", id: 1, scopes: [] });
+
+    const res = await app.request("/revoke", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ token: "idp_to_revoke" }).toString(),
+    });
+    expect(res.status).toBe(200);
+    expect(tokenMap.has("idp_to_revoke")).toBe(false);
+  });
+
+  it("returns 200 for unknown token (per RFC 7009)", async () => {
+    const { app } = createTestApp();
+    const res = await app.request("/revoke", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ token: "nonexistent" }).toString(),
+    });
+    expect(res.status).toBe(200);
+  });
+});
+
+describe("Debug", () => {
+  it("returns state in permissive mode", async () => {
+    const { app } = createTestApp();
+    const res = await app.request("/_debug/state");
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.users_count).toBeDefined();
+    expect(body.clients_count).toBeDefined();
+    expect(body.signing_keys).toBeDefined();
+  });
+
+  it("returns 403 in strict mode", async () => {
+    const { app } = createTestApp({ strict: true });
+    const res = await app.request("/_debug/state");
+    expect(res.status).toBe(403);
+  });
+});
+
+describe("ID Token Validation", () => {
+  it("ID token verifies against JWKS public key", async () => {
+    const { app } = createTestApp({
+      users: [{ email: "alice@example.com" }],
+    });
+
+    // Get auth code
+    const cbRes = await app.request("/authorize/callback", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        uid: "any", redirect_uri: "http://localhost:3000/cb", scope: "openid", client_id: "test", nonce: "test-nonce",
+      }).toString(),
+    });
+    const code = new URL(cbRes.headers.get("Location")!).searchParams.get("code")!;
+
+    // Exchange for tokens
+    const tokenRes = await app.request("/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ grant_type: "authorization_code", code, redirect_uri: "http://localhost:3000/cb" }).toString(),
+    });
+    const tokens = await tokenRes.json();
+
+    // Fetch JWKS
+    const jwksRes = await app.request("/jwks.json");
+    const jwks = await jwksRes.json();
+
+    // Verify ID token against JWKS
+    const { importJWK, jwtVerify } = await import("jose");
+    const pubKey = await importJWK(jwks.keys[0], "RS256");
+    const { payload } = await jwtVerify(tokens.id_token, pubKey);
+    expect(payload.iss).toBe("http://localhost:4003");
+    expect(payload.nonce).toBe("test-nonce");
   });
 });
