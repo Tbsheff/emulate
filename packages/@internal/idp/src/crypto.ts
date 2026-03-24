@@ -1,4 +1,6 @@
-import { createHash, generateKeyPairSync, createPublicKey, randomBytes } from "crypto";
+import "reflect-metadata";
+import { createHash, generateKeyPairSync, createPublicKey, randomBytes, webcrypto } from "crypto";
+import type { Store } from "@internal/core";
 import { SignJWT, importPKCS8 } from "jose";
 import type { IdpUser } from "./entities.js";
 import type { IdpSigningKey } from "./entities.js";
@@ -104,4 +106,78 @@ export function verifyPkce(
     return codeVerifier === codeChallenge;
   }
   return false;
+}
+
+export async function generateSelfSignedCert(privateKeyPem: string): Promise<string> {
+  // Import the private key as a CryptoKey for @peculiar/x509
+  const { X509CertificateGenerator, Extension } = await import("@peculiar/x509");
+
+  // Set the crypto provider to Node's webcrypto
+  const x509Module = await import("@peculiar/x509");
+  x509Module.cryptoProvider.set(webcrypto as unknown as Crypto);
+
+  // Import the RSA key pair
+  const privateKeyDer = pemToDer(privateKeyPem);
+  const cryptoPrivateKey = await webcrypto.subtle.importKey(
+    "pkcs8",
+    privateKeyDer,
+    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+    true,
+    ["sign"]
+  );
+
+  // Extract public key from private
+  const publicKeyJwk = await webcrypto.subtle.exportKey("jwk", cryptoPrivateKey);
+  delete publicKeyJwk.d;
+  delete publicKeyJwk.p;
+  delete publicKeyJwk.q;
+  delete publicKeyJwk.dp;
+  delete publicKeyJwk.dq;
+  delete publicKeyJwk.qi;
+  publicKeyJwk.key_ops = ["verify"];
+  const cryptoPublicKey = await webcrypto.subtle.importKey(
+    "jwk",
+    publicKeyJwk,
+    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+    true,
+    ["verify"]
+  );
+
+  const now = new Date();
+  const notAfter = new Date(now);
+  notAfter.setFullYear(notAfter.getFullYear() + 10);
+
+  const cert = await X509CertificateGenerator.createSelfSigned({
+    serialNumber: "01",
+    name: "CN=emulate-idp",
+    notBefore: now,
+    notAfter,
+    signingAlgorithm: { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+    keys: { privateKey: cryptoPrivateKey, publicKey: cryptoPublicKey },
+    extensions: [
+      new Extension("2.5.29.19", true, new Uint8Array([0x30, 0x00])), // Basic Constraints: CA=false
+    ],
+  });
+
+  return cert.toString("pem");
+}
+
+function pemToDer(pem: string): ArrayBuffer {
+  const base64 = pem
+    .replace(/-----BEGIN [A-Z ]+-----/g, "")
+    .replace(/-----END [A-Z ]+-----/g, "")
+    .replace(/\s/g, "");
+  const binary = Buffer.from(base64, "base64");
+  return binary.buffer.slice(binary.byteOffset, binary.byteOffset + binary.byteLength);
+}
+
+export function getPublicCertBase64(certPem: string): string {
+  return certPem
+    .replace(/-----BEGIN CERTIFICATE-----/g, "")
+    .replace(/-----END CERTIFICATE-----/g, "")
+    .replace(/\s/g, "");
+}
+
+export function getCertificatePem(store: Store): string | null {
+  return store.getData<string>("idp.saml.certificatePem") ?? null;
 }
