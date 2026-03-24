@@ -135,6 +135,14 @@ const defaultIdpConfig = {
         },
       ],
     },
+    saml: {
+      service_providers: [
+        {
+          entity_id: "http://localhost:3000",
+          acs_url: "http://localhost:3000/api/auth/sso/saml2/callback/local-idp",
+        },
+      ],
+    },
   },
 };
 
