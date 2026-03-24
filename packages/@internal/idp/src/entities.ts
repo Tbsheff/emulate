@@ -39,3 +39,10 @@ export interface IdpSigningKey extends Entity {
   public_key_jwk: Record<string, unknown>;
   active: boolean;
 }
+
+export interface IdpServiceProvider extends Entity {
+  entity_id: string;
+  acs_url: string;
+  name_id_format: string;
+  attribute_mappings: Record<string, string>;
+}

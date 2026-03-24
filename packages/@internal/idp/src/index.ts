@@ -4,6 +4,7 @@ import { getIdpStore } from "./store.js";
 import { generateUid } from "./helpers.js";
 import { generateSigningKeySync, importSigningKey } from "./crypto.js";
 import { oidcRoutes } from "./routes/oidc.js";
+import { samlRoutes } from "./routes/saml.js";
 import { ENTRA_ID_ATTRIBUTE_MAPPINGS } from "./saml-constants.js";
 
 export { getIdpStore, type IdpStore } from "./store.js";
@@ -204,6 +205,7 @@ export const idpPlugin: ServicePlugin = {
   register(app: Hono<AppEnv>, store: Store, webhooks: WebhookDispatcher, baseUrl: string, tokenMap?: TokenMap): void {
     const ctx: RouteContext = { app, store, webhooks, baseUrl, tokenMap };
     oidcRoutes(ctx);
+    samlRoutes(ctx);
   },
   seed(store: Store, baseUrl: string): void {
     seedDefaults(store, baseUrl);
