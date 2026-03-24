@@ -4,6 +4,7 @@ import { getIdpStore } from "./store.js";
 import { generateUid } from "./helpers.js";
 import { generateSigningKeySync, importSigningKey } from "./crypto.js";
 import { oidcRoutes } from "./routes/oidc.js";
+import { ENTRA_ID_ATTRIBUTE_MAPPINGS } from "./saml-constants.js";
 
 export { getIdpStore, type IdpStore } from "./store.js";
 export * from "./entities.js";
@@ -46,6 +47,16 @@ export interface IdpSeedConfig {
       access_token_ttl?: number;
       id_token_ttl?: number;
       refresh_token_ttl?: number;
+    }>;
+  };
+  saml?: {
+    entity_id?: string;
+    certificate_pem?: string;
+    service_providers?: Array<{
+      entity_id: string;
+      acs_url: string;
+      name_id_format?: string;
+      attribute_mappings?: Record<string, string>;
     }>;
   };
 }
@@ -163,6 +174,28 @@ export function seedFromConfig(store: Store, _baseUrl: string, config: IdpSeedCo
       public_key_jwk: key.public_key_jwk,
       active: key.active,
     });
+  }
+
+  // SAML configuration
+  if (config.saml?.entity_id) {
+    store.setData("idp.saml.entityId", config.saml.entity_id);
+  }
+
+  if (config.saml?.certificate_pem) {
+    store.setData("idp.saml.certificatePem", config.saml.certificate_pem);
+  }
+
+  if (config.saml?.service_providers) {
+    for (const sp of config.saml.service_providers) {
+      const existing = idp.serviceProviders.findOneBy("entity_id", sp.entity_id);
+      if (existing) continue;
+      idp.serviceProviders.insert({
+        entity_id: sp.entity_id,
+        acs_url: sp.acs_url,
+        name_id_format: sp.name_id_format ?? "emailAddress",
+        attribute_mappings: sp.attribute_mappings ?? ENTRA_ID_ATTRIBUTE_MAPPINGS,
+      });
+    }
   }
 }
 

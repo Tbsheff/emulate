@@ -95,3 +95,24 @@ export function getTokenClients(store: Store): Map<string, string> {
   }
   return map;
 }
+
+export type PendingSamlRequest = {
+  requestId: string;
+  acsUrl: string;
+  spEntityId: string;
+  relayState: string;
+  created_at: number;
+};
+
+export function getPendingSamlRequests(store: Store): Map<string, PendingSamlRequest> {
+  let map = store.getData<Map<string, PendingSamlRequest>>("idp.saml.pendingRequests");
+  if (!map) {
+    map = new Map();
+    store.setData("idp.saml.pendingRequests", map);
+  }
+  return map;
+}
+
+export function getSamlEntityId(store: Store, baseUrl: string): string {
+  return store.getData<string>("idp.saml.entityId") ?? `${baseUrl}/saml/metadata`;
+}
